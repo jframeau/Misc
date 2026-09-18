@@ -1,0 +1,121 @@
+#!/bin/env python3
+
+import MySQLdb
+import argparse
+import sys
+
+def update_macros_in_db(dry_run=True):
+    # Configuration de la connexion
+    config = {
+        'user': 'centreon',
+        'password': 'pYK!3lP2?5g?1!Zc',
+        'host': 'localhost',
+        'database': 'centreon'
+    }
+
+    # Paramètres de recherche
+    regex_pattern = 'sd' 
+    macro_name_filter = "$_HOSTARGUMENT$"
+
+    connection = None
+    try:
+        # 1. Connexion à la base de données
+        connection = MySQLdb.connect(**config)
+        cursor = connection.cursor()
+
+        # 2, 3 et 4. Requête SQL
+        # MySQLdb retourne par défaut des tuples, on définit l'ordre des colonnes clairement
+        query = """
+            SELECT 
+                h.host_id, 
+                h.host_name, 
+                m.host_macro_name,
+                m.host_macro_value
+            FROM host h
+            JOIN on_demand_macro_host m ON m.host_host_id = h.host_id
+            WHERE h.host_name REGEXP %s
+            AND m.host_macro_name = %s
+        """
+
+        cursor.execute(query, (regex_pattern, macro_name_filter))
+        results = cursor.fetchall()
+
+        if results:
+            print(f"Nombre de résultats trouvés : {len(results)}")
+            print("-" * 80)
+            
+            for row in results:
+                # On déballe le tuple pour plus de clarté
+                host_id, host_name, macro_name, original_value = row
+                
+                # --- Logique de traitement du champ host_macro_value ---
+                parts = original_value.split(' ', 1)
+                first_field = parts[0]
+
+                # Vérifier si le premier champ est déjà entouré de guillemets doubles
+                is_already_quoted = first_field.startswith('"') and first_field.endswith('"')
+
+                if not is_already_quoted:
+                    quoted_first = f'"{first_field}"'
+                    
+                    if len(parts) > 1:
+                        new_value = f'{quoted_first} {parts[1]}'
+                    else:
+                        new_value = quoted_first
+                else:
+                    new_value = original_value
+
+                # On utilise host_host_id et host_macro_name pour être précis
+                if not dry_run:
+                    query_update = """
+                        UPDATE on_demand_macro_host
+                        SET host_macro_value = %s
+                        WHERE host_host_id = %s AND host_macro_name = %s
+                    """
+
+                    cursor.execute(query_update, (new_value, host_id, macro_name))
+
+                # Affichage
+                print(f"Host: {host_name} (ID: {host_id})")
+                print(f"  Macro: {macro_name}")
+                print(f"  Original: {original_value}")
+                print(f"  Modifié : {new_value}")
+                print("-" * 80)
+
+            # 4. Validation de toutes les modifications
+            if not dry_run:
+                connection.commit()
+                print("Transaction validée avec succès.")
+
+        else:
+            print("Aucun résultat ne correspond aux critères.")
+
+    except MySQLError as e:
+        print(f"Erreur MySQL : {e}")
+    except Exception as e:
+        print(f"Une erreur inattendue est survenue : {e}")
+    finally:
+        # Fermeture de la connexion
+        if connection:
+            cursor.close()
+            connection.close()
+            print("\nConnexion à la base de données fermée.")
+
+def main():
+    # Configuration de l'analyseur d'arguments
+    parser = argparse.ArgumentParser(description="Mettre à jour les macros host avec des guillemets sur le premier champ.")
+
+    # Ajout de l'option --dry-run
+    parser.add_argument(
+        '-d', '--dry-run',
+        action='store_true',
+        help="Affiche les modifications sans les appliquer à la base de données."
+    )
+
+    args = parser.parse_args()
+
+    # Appel de la fonction principale avec l'argument dry_run
+    update_macros_in_db(dry_run=args.dry_run)
+
+if __name__ == "__main__":
+    main()
