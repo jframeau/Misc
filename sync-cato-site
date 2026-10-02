@@ -18,7 +18,7 @@ DEFAULT_CENTREON_API_VERSION = "latest"
 DEFAULT_HOST_ADDRESS = "127.0.0.1"
 
 HOST_TEMPLATE_NAMES = [
-    "virt-cato",
+    "Virt-Cato",
     "generic-dummy-host-custom",
 ]
 
@@ -109,11 +109,56 @@ class CatoAPI:
 
         return payload
 
-    def get_sites(self) -> List[Dict[str, str]]:
-        """
-        Récupère tous les sites Cato via entityLookup.
+    def get_site_location(self, site_id: str) -> Dict[str, str]:
+        query = """
+        query siteGeneralDetails(
+            $accountId: ID!,
+            $site: SiteRefInput!
+        ) {
+            site(accountId: $accountId) {
+                siteGeneralDetails(site: $site) {
+                    site {
+                        id
+                        name
+                    }
+                    siteLocation {
+                        cityName
+                    }
+                }
+            }
+        }
         """
 
+        variables = {
+            "accountId": self.account_id,
+            "site": {
+                "input": site_id,
+                "by": "ID",
+            },
+        }
+
+        payload = self.graphql(query, variables)
+
+        try:
+            details = (
+                payload["data"]["site"]["siteGeneralDetails"]
+            )
+
+            location = details.get("siteLocation") or {}
+
+            return {
+                "city_name": str(
+                    location.get("cityName") or ""
+                ),
+            }
+
+        except (KeyError, TypeError) as exc:
+            raise APIError(
+                f"Structure inattendue pour les détails "
+                f"du site Cato {site_id}."
+            ) from exc
+
+    def get_sites(self) -> List[Dict[str, str]]:
         query = """
         query EntityLookup(
             $accountID: ID!,
@@ -172,10 +217,21 @@ class CatoAPI:
                 if not site_id:
                     continue
 
+                site_id = str(site_id)
+                site_name = str(site_name or site_id)
+
+                location = self.get_site_location(site_id)
+
+                city_name = location.get("city_name")
+
+                # Fallback si Cato n'a pas de ville renseignée.
+                alias = city_name or site_name
+
                 sites.append(
                     {
-                        "id": str(site_id),
-                        "name": str(site_name or site_id),
+                        "id": site_id,
+                        "name": site_name,
+                        "city_name": alias,
                     }
                 )
 
@@ -896,6 +952,8 @@ class Synchronizer:
         skipped = 0
 
         for site in sites[:5]:
+            if not site["name"].startswith('M_'): continue
+
             host_name = self.build_host_name(site["name"])
 
             existing = self.centreon.find_host_by_name(
@@ -922,7 +980,7 @@ class Synchronizer:
                         {
                             "id": host_id,
                             "name": host_name,
-                            "alias": site["name"],
+                            "alias": site["city_name"],
                         }
                     )
                 else:
