@@ -1,0 +1,1312 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+import requests
+import urllib3
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+DEFAULT_CATO_API_URL = "https://api.catonetworks.com/api/v1/graphql2"
+DEFAULT_CENTREON_API_VERSION = "latest"
+DEFAULT_HOST_ADDRESS = "127.0.0.1"
+
+HOST_TEMPLATE_NAMES = [
+    "virt-cato",
+    "generic-dummy-host-custom",
+]
+
+DUMMY_STATUS_MACRO = "DUMMYSTATUS"
+DUMMY_OUTPUT_MACRO = "DUMMYOUTPUT"
+SITEID_MACRO       = "SITEID"
+
+
+# ============================================================================
+# Exceptions
+# ============================================================================
+
+class APIError(Exception):
+    pass
+
+
+# ============================================================================
+# Cato API
+# ============================================================================
+
+class CatoAPI:
+    def __init__(
+        self,
+        api_key: str,
+        account_id: str,
+        api_url: str = DEFAULT_CATO_API_URL,
+        verify_ssl: bool = True,
+        debug: bool = False,
+    ):
+        self.api_key = api_key
+        self.account_id = account_id
+        self.api_url = api_url
+        self.verify_ssl = verify_ssl
+        self.debug = debug
+
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "x-api-key": self.api_key,
+            }
+        )
+
+    def graphql(
+        self,
+        query: str,
+        variables: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if self.debug:
+            print(f"[DEBUG] Cato POST {self.api_url}")
+            print(f"[DEBUG] variables={variables}")
+
+        try:
+            response = self.session.post(
+                self.api_url,
+                json={
+                    "query": query,
+                    "variables": variables,
+                },
+                verify=self.verify_ssl,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise APIError(f"Erreur réseau Cato : {exc}") from exc
+
+        if self.debug:
+            print(f"[DEBUG] Cato HTTP {response.status_code}")
+            print(f"[DEBUG] Cato response: {response.text}")
+
+        if not response.ok:
+            raise APIError(
+                f"Erreur HTTP Cato {response.status_code}: "
+                f"{response.text}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise APIError(
+                "Réponse Cato invalide : JSON attendu."
+            ) from exc
+
+        if payload.get("errors"):
+            raise APIError(
+                f"Erreur GraphQL Cato : {payload['errors']}"
+            )
+
+        return payload
+
+    def get_sites(self) -> List[Dict[str, str]]:
+        """
+        Récupère tous les sites Cato via entityLookup.
+        """
+
+        query = """
+        query EntityLookup(
+            $accountID: ID!,
+            $type: EntityType!,
+            $from: Int!,
+            $limit: Int!
+        ) {
+            entityLookup(
+                accountID: $accountID,
+                type: $type,
+                from: $from,
+                limit: $limit
+            ) {
+                items {
+                    entity {
+                        id
+                        name
+                    }
+                }
+            }
+        }
+        """
+
+        sites: List[Dict[str, str]] = []
+
+        offset = 0
+        limit = 100
+
+        while True:
+            variables = {
+                "accountID": self.account_id,
+                "type": "site",
+                "from": offset,
+                "limit": limit,
+            }
+
+            payload = self.graphql(query, variables)
+
+            try:
+                items = payload["data"]["entityLookup"]["items"]
+            except (KeyError, TypeError) as exc:
+                raise APIError(
+                    "Structure inattendue dans la réponse Cato "
+                    "pour entityLookup."
+                ) from exc
+
+            if not items:
+                break
+
+            for item in items:
+                entity = item.get("entity") or {}
+
+                site_id = entity.get("id")
+                site_name = entity.get("name")
+
+                if not site_id:
+                    continue
+
+                sites.append(
+                    {
+                        "id": str(site_id),
+                        "name": str(site_name or site_id),
+                    }
+                )
+
+            if len(items) < limit:
+                break
+
+            offset += limit
+
+        return sites
+
+
+# ============================================================================
+# Centreon API
+# ============================================================================
+
+class CentreonAPI:
+    def __init__(
+        self,
+        base_url: str,
+        api_version: str,
+        username: str,
+        password: str,
+        verify_ssl: bool = True,
+        debug: bool = False,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.api_version = api_version.strip("/")
+        self.username = username
+        self.password = password
+        self.verify_ssl = verify_ssl
+        self.debug = debug
+
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+        )
+
+        self.token: Optional[str] = None
+
+    @property
+    def api_base(self) -> str:
+        return (
+            f"{self.base_url}/centreon/api/"
+            f"{self.api_version}"
+        )
+
+    def login(self) -> None:
+        url = f"{self.api_base}/login"
+
+        payload = {
+            "security": {
+                "credentials": {
+                    "login": self.username,
+                    "password": self.password,
+                }
+            }
+        }
+
+        if self.debug:
+            print(f"[DEBUG] Centreon POST {url}")
+
+        try:
+            response = self.session.post(
+                url,
+                json=payload,
+                verify=self.verify_ssl,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise APIError(
+                f"Erreur réseau Centreon lors du login : {exc}"
+            ) from exc
+
+        if self.debug:
+            print(f"[DEBUG] Centreon login HTTP {response.status_code}")
+            print(f"[DEBUG] Centreon login response: {response.text}")
+
+        if not response.ok:
+            raise APIError(
+                f"Erreur HTTP Centreon {response.status_code} "
+                f"sur POST login: {response.text}"
+            )
+
+        try:
+            data = response.json()
+            self.token = data["security"]["token"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise APIError(
+                "Impossible de récupérer le token Centreon."
+            ) from exc
+
+        self.session.headers.update(
+            {
+                "X-AUTH-TOKEN": self.token,
+            }
+        )
+
+    def request(
+        self,
+        method: str,
+        endpoint: str,
+        json_data: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        url = f"{self.api_base}/{endpoint.lstrip('/')}"
+
+        if self.debug:
+            print(f"[DEBUG] Centreon {method.upper()} {url}")
+            if json_data is not None:
+                print(f"[DEBUG] payload={json_data}")
+
+        try:
+            response = self.session.request(
+                method=method.upper(),
+                url=url,
+                json=json_data,
+                verify=self.verify_ssl,
+                timeout=120,
+            )
+        except requests.RequestException as exc:
+            raise APIError(
+                f"Erreur réseau Centreon sur "
+                f"{method.upper()} {endpoint}: {exc}"
+            ) from exc
+
+        if self.debug:
+            print(f"[DEBUG] Centreon HTTP {response.status_code}")
+            print(f"[DEBUG] response={response.text}")
+
+        if not response.ok:
+            try:
+                details = response.json()
+            except ValueError:
+                details = response.text
+
+            raise APIError(
+                f"Erreur HTTP Centreon {response.status_code} "
+                f"sur {method.upper()} {endpoint}:\n"
+                f"{details}"
+            )
+
+        if response.status_code == 204 or not response.content:
+            return None
+
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+    # ------------------------------------------------------------------------
+    # Generic pagination
+    # ------------------------------------------------------------------------
+
+    def list_all(
+        self,
+        endpoint: str,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        page = 1
+
+        while True:
+            separator = "&" if "?" in endpoint else "?"
+            paginated_endpoint = (
+                f"{endpoint}{separator}"
+                f"page={page}&limit={limit}"
+            )
+
+            data = self.request(
+                "GET",
+                paginated_endpoint,
+            )
+
+            if not isinstance(data, dict):
+                break
+
+            current = data.get("result", [])
+
+            if not current:
+                break
+
+            results.extend(current)
+
+            meta = data.get("meta") or {}
+            total = meta.get("total")
+
+            if total is not None and len(results) >= int(total):
+                break
+
+            if len(current) < limit:
+                break
+
+            page += 1
+
+        return results
+
+    # ------------------------------------------------------------------------
+    # Host templates
+    # ------------------------------------------------------------------------
+
+    def get_host_templates(self) -> List[Dict[str, Any]]:
+        return self.list_all(
+            "configuration/hosts/templates"
+        )
+
+    def resolve_host_template_ids(
+        self,
+        template_names: List[str],
+    ) -> Dict[str, int]:
+        templates = self.get_host_templates()
+
+        by_name = {
+            str(template["name"]): int(template["id"])
+            for template in templates
+            if template.get("name") is not None
+            and template.get("id") is not None
+        }
+
+        resolved: Dict[str, int] = {}
+
+        for name in template_names:
+            if name not in by_name:
+                raise APIError(
+                    f"Template d'hôte Centreon introuvable : {name}"
+                )
+
+            resolved[name] = by_name[name]
+
+        return resolved
+
+    # ------------------------------------------------------------------------
+    # Host groups
+    # ------------------------------------------------------------------------
+
+    def get_host_groups(self) -> List[Dict[str, Any]]:
+        return self.list_all(
+            "configuration/hosts/groups"
+        )
+
+    def resolve_host_group_id(
+        self,
+        group_name: str,
+    ) -> int:
+        groups = self.get_host_groups()
+
+        for group in groups:
+            if str(group.get("name")) == group_name:
+                return int(group["id"])
+
+        raise APIError(
+            f"Hostgroup Centreon introuvable : {group_name}"
+        )
+
+    # ------------------------------------------------------------------------
+    # Hosts
+    # ------------------------------------------------------------------------
+
+    def get_hosts(self) -> List[Dict[str, Any]]:
+        return self.list_all(
+            "configuration/hosts"
+        )
+
+    def find_host_by_name(
+        self,
+        hosts: List[Dict[str, Any]],
+        name: str,
+    ) -> Optional[Dict[str, Any]]:
+        for host in hosts:
+            if str(host.get("name")) == name:
+                return host
+
+        return None
+
+    def create_host(
+        self,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        data = self.request(
+            "POST",
+            "configuration/hosts",
+            json_data=payload,
+        )
+
+        if not isinstance(data, dict):
+            raise APIError(
+                "Réponse inattendue lors de la création de l'hôte Centreon."
+            )
+
+        return data
+
+    def update_host(
+        self,
+        host_id: int,
+        payload: Dict[str, Any],
+    ) -> Any:
+        return self.request(
+            "PATCH",
+            f"configuration/hosts/{host_id}",
+            json_data=payload,
+        )
+
+    # ------------------------------------------------------------------------
+    # Services
+    # ------------------------------------------------------------------------
+
+    def deploy_host_services(
+        self,
+        host_id: int,
+    ) -> Any:
+        """
+        Déploie les services associés aux templates d'hôte.
+
+        Centreon 24.10 :
+        POST /configuration/hosts/{host_id}/services/deploy
+
+        Le endpoint accepte un body vide.
+        """
+
+        return self.request(
+            "POST",
+            f"configuration/hosts/{host_id}/services/deploy",
+        )
+
+    # ------------------------------------------------------------------------
+    # Generate + reload
+    # ------------------------------------------------------------------------
+
+    def generate_and_reload(
+        self,
+        poller_id: int,
+    ) -> Any:
+        return self.request(
+            "GET",
+            f"configuration/monitoring-servers/"
+            f"{poller_id}/generate-and-reload",
+        )
+
+
+# ============================================================================
+# Macro helpers
+# ============================================================================
+
+def normalize_macro(
+    macro: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Centreon exige notamment is_password et description.
+
+    On conserve les autres propriétés éventuellement retournées par
+    l'API, par exemple id.
+    """
+
+    normalized = dict(macro)
+
+    if "name" not in normalized:
+        normalized["name"] = ""
+
+    if "value" not in normalized:
+        normalized["value"] = ""
+
+    if "is_password" not in normalized:
+        normalized["is_password"] = False
+    elif normalized["is_password"] is None:
+        normalized["is_password"] = False
+
+    if "description" not in normalized:
+        normalized["description"] = ""
+    elif normalized["description"] is None:
+        normalized["description"] = ""
+
+    return normalized
+
+
+def normalize_macros(
+    macros: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if not macros:
+        return []
+
+    return [
+        normalize_macro(macro)
+        for macro in macros
+        if isinstance(macro, dict)
+    ]
+
+
+def merge_macro(
+    macros: List[Dict[str, Any]],
+    name: str,
+    value: str,
+    description: str,
+) -> bool:
+    """
+    Ajoute ou modifie une macro.
+
+    Retourne True si le contenu a été modifié.
+    """
+
+    for macro in macros:
+        if str(macro.get("name", "")).upper() == name.upper():
+            changed = False
+
+            if str(macro.get("value", "")) != str(value):
+                macro["value"] = str(value)
+                changed = True
+
+            if macro.get("is_password") is None:
+                macro["is_password"] = False
+                changed = True
+
+            if macro.get("description") is None:
+                macro["description"] = description
+                changed = True
+
+            if "is_password" not in macro:
+                macro["is_password"] = False
+                changed = True
+
+            if "description" not in macro:
+                macro["description"] = description
+                changed = True
+
+            return changed
+
+    macros.append(
+        {
+            "name": name,
+            "value": str(value),
+            "is_password": False,
+            "description": description,
+        }
+    )
+
+    return True
+
+
+# ============================================================================
+# Synchronizer
+# ============================================================================
+
+class Synchronizer:
+    def __init__(
+        self,
+        cato: CatoAPI,
+        centreon: CentreonAPI,
+        dry_run: bool = False,
+        debug: bool = False,
+        host_address: str = DEFAULT_HOST_ADDRESS,
+        hostgroup_id: Optional[int] = None,
+    ):
+        self.cato = cato
+        self.centreon = centreon
+        self.dry_run = dry_run
+        self.debug = debug
+        self.host_address = host_address
+        self.hostgroup_id = hostgroup_id
+
+    def build_host_name(
+        self,
+        site_id: str,
+    ) -> str:
+        return f"M_{site_id}_CatoSite"
+
+    def build_create_payload(
+        self,
+        site: Dict[str, str],
+        template_ids: List[int],
+    ) -> Dict[str, Any]:
+        site_id = site["id"]
+        site_name = site["name"]
+
+        payload: Dict[str, Any] = {
+            "monitoring_server_id": 0,
+            "name": self.build_host_name(site_id),
+            "address": self.host_address,
+            "alias": site_name,
+            "templates": template_ids,
+            "macros": [
+                {
+                    "name": DUMMY_STATUS_MACRO,
+                    "value": "OK",
+                    "is_password": False,
+                    "description": "Dummy host status",
+                },
+                {
+                    "name": DUMMY_OUTPUT_MACRO,
+                    "value": site_id,
+                    "is_password": False,
+                    "description": "Cato site ID",
+                },
+                {
+                    "name": SITEID_MACRO,
+                    "value": site_id,
+                    "is_password": False,
+                    "description": "Cato site ID",
+                },
+            ],
+        }
+
+        if self.hostgroup_id is not None:
+            payload["groups"] = [self.hostgroup_id]
+
+        return payload
+
+    def build_update_payload(
+        self,
+        host: Dict[str, Any],
+        site: Dict[str, str],
+        template_ids: List[int],
+    ) -> Dict[str, Any]:
+        """
+        Construit uniquement les propriétés que nous voulons maintenir
+        sur un hôte existant.
+
+        On conserve les macros existantes afin de ne pas supprimer une
+        éventuelle macro ajoutée manuellement.
+        """
+
+        current_templates = host.get("templates") or []
+
+        existing_template_ids: List[int] = []
+
+        for template in current_templates:
+            if isinstance(template, dict):
+                template_id = template.get("id")
+            else:
+                template_id = template
+
+            if template_id is not None:
+                existing_template_ids.append(int(template_id))
+
+        merged_template_ids = list(existing_template_ids)
+
+        for template_id in template_ids:
+            if template_id not in merged_template_ids:
+                merged_template_ids.append(template_id)
+
+        macros = normalize_macros(host.get("macros"))
+
+        merge_macro(
+            macros,
+            DUMMY_STATUS_MACRO,
+            "OK",
+            "Dummy host status",
+        )
+
+        merge_macro(
+            macros,
+            DUMMY_OUTPUT_MACRO,
+            site["id"],
+            "Cato site ID",
+        )
+
+        payload: Dict[str, Any] = {
+            "templates": merged_template_ids,
+            "macros": macros,
+            "address": self.host_address,
+            "alias": site["name"],
+        }
+
+        merge_macro(
+            macros,
+            SITEID_MACRO,
+            site["id"],
+            "Cato site ID",
+        )
+        if self.hostgroup_id is not None:
+            payload["groups"] = [self.hostgroup_id]
+
+        return payload
+
+    def deploy_services(
+        self,
+        host_id: int,
+        host_name: str,
+    ) -> None:
+        if self.dry_run:
+            print(
+                f"  [DRY-RUN] Déploiement des services "
+                f"pour {host_name} (ID {host_id})"
+            )
+            return
+
+        print(
+            f"  Déploiement des services "
+            f"pour {host_name} (ID {host_id})..."
+        )
+
+        self.centreon.deploy_host_services(host_id)
+
+        print("  Services déployés.")
+
+    def synchronize_site(
+        self,
+        site: Dict[str, str],
+        existing_hosts: List[Dict[str, Any]],
+        template_ids: List[int],
+    ) -> Optional[int]:
+        site_id = site["id"]
+        site_name = site["name"]
+        host_name = self.build_host_name(site_id)
+
+        print(
+            f"\nSite Cato : {site_name} "
+            f"(ID={site_id})"
+        )
+        print(f"  Hôte Centreon : {host_name}")
+
+        existing_host = self.centreon.find_host_by_name(
+            existing_hosts,
+            host_name,
+        )
+
+        if existing_host is None:
+            payload = self.build_create_payload(
+                site,
+                template_ids,
+            )
+
+            if self.dry_run:
+                print("  [DRY-RUN] Création de l'hôte.")
+                if self.debug:
+                    print(f"  [DEBUG] payload={payload}")
+
+                return None
+
+            print("  Création de l'hôte...")
+
+            created = self.centreon.create_host(payload)
+
+            host_id = created.get("id")
+
+            if host_id is None:
+                raise APIError(
+                    f"L'API Centreon n'a pas retourné l'ID "
+                    f"du nouvel hôte {host_name}."
+                )
+
+            host_id = int(host_id)
+
+            print(f"  Hôte créé (ID={host_id}).")
+
+        else:
+            host_id = int(existing_host["id"])
+
+            payload = self.build_update_payload(
+                existing_host,
+                site,
+                template_ids,
+            )
+
+            if self.dry_run:
+                print(
+                    f"  [DRY-RUN] Mise à jour de l'hôte "
+                    f"(ID={host_id})."
+                )
+
+                if self.debug:
+                    print(f"  [DEBUG] payload={payload}")
+
+                return None
+
+            print(
+                f"  Mise à jour de l'hôte "
+                f"(ID={host_id})..."
+            )
+
+            self.centreon.update_host(
+                host_id,
+                payload,
+            )
+
+            print("  Hôte mis à jour.")
+
+        # Important :
+        # on demande à Centreon de matérialiser les services définis
+        # par les templates d'hôte associés, via virt-cato.
+        self.deploy_services(
+            host_id,
+            host_name,
+        )
+
+        return host_id
+
+    def run(
+        self,
+        template_ids_by_name: Dict[str, int],
+    ) -> None:
+        print("Récupération des sites Cato...")
+
+        sites = self.cato.get_sites()
+
+        print(f"{len(sites)} site(s) Cato trouvé(s).")
+
+        if not sites:
+            print("Aucun site Cato à synchroniser.")
+            return
+
+        print("Récupération des hôtes Centreon...")
+
+        existing_hosts = self.centreon.get_hosts()
+
+        print(
+            f"{len(existing_hosts)} hôte(s) Centreon trouvé(s)."
+        )
+
+        template_ids = [
+            template_ids_by_name[name]
+            for name in HOST_TEMPLATE_NAMES
+        ]
+
+        created = 0
+        updated = 0
+        skipped = 0
+
+        for site in sites:
+            host_name = self.build_host_name(site["id"])
+
+            existing = self.centreon.find_host_by_name(
+                existing_hosts,
+                host_name,
+            )
+
+            try:
+                host_id = self.synchronize_site(
+                    site,
+                    existing_hosts,
+                    template_ids,
+                )
+
+                if self.dry_run:
+                    skipped += 1
+                elif existing is None:
+                    created += 1
+
+                    # Ajouter l'hôte à la liste locale permet de rester
+                    # cohérent si plusieurs éléments venaient à pointer
+                    # vers le même nom.
+                    existing_hosts.append(
+                        {
+                            "id": host_id,
+                            "name": host_name,
+                            "alias": site["name"],
+                        }
+                    )
+                else:
+                    updated += 1
+
+            except APIError:
+                print(
+                    f"  ERREUR lors de la synchronisation de "
+                    f"{host_name}",
+                    file=sys.stderr,
+                )
+                raise
+
+        print("\n--- Résumé ---")
+
+        if self.dry_run:
+            print(f"  Mode dry-run : {skipped} site(s) analysé(s)")
+            print("  Aucune modification Centreon effectuée.")
+        else:
+            print(f"  Hôtes créés   : {created}")
+            print(f"  Hôtes mis à jour : {updated}")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def env_or_none(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+
+    value = value.strip()
+
+    return value if value else None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Synchronise les sites Cato Networks "
+            "avec Centreon via les API REST/GraphQL."
+        )
+    )
+
+    # ------------------------------------------------------------------------
+    # Cato
+    # ------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--cato-api-key",
+        default=env_or_none("CATO_API_KEY"),
+        help="Clé API Cato (env: CATO_API_KEY)",
+    )
+
+    parser.add_argument(
+        "--cato-account-id",
+        default=env_or_none("CATO_ACCOUNT_ID"),
+        help="Account ID Cato (env: CATO_ACCOUNT_ID)",
+    )
+
+    parser.add_argument(
+        "--cato-api-url",
+        default=(
+            env_or_none("CATO_API_URL")
+            or DEFAULT_CATO_API_URL
+        ),
+        help=(
+            "URL GraphQL Cato "
+            "(env: CATO_API_URL)"
+        ),
+    )
+
+    # ------------------------------------------------------------------------
+    # Centreon
+    # ------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--centreon-url",
+        default=env_or_none("CENTREON_URL"),
+        help="URL de base Centreon (env: CENTREON_URL)",
+    )
+
+    parser.add_argument(
+        "--centreon-api-version",
+        default=(
+            env_or_none("CENTREON_API_VERSION")
+            or DEFAULT_CENTREON_API_VERSION
+        ),
+        help=(
+            "Version API Centreon "
+            "(env: CENTREON_API_VERSION, défaut: latest)"
+        ),
+    )
+
+    parser.add_argument(
+        "--centreon-user",
+        default=env_or_none("CENTREON_USER"),
+        help="Utilisateur Centreon (env: CENTREON_USER)",
+    )
+
+    parser.add_argument(
+        "--centreon-password",
+        default=env_or_none("CENTREON_PASSWORD"),
+        help="Mot de passe Centreon (env: CENTREON_PASSWORD)",
+    )
+
+    parser.add_argument(
+        "--centreon-poller-id",
+        type=int,
+        default=(
+            int(os.environ["CENTREON_POLLER_ID"])
+            if env_or_none("CENTREON_POLLER_ID")
+            else None
+        ),
+        help=(
+            "ID du poller Centreon pour generate-and-reload "
+            "(env: CENTREON_POLLER_ID)"
+        ),
+    )
+
+    parser.add_argument(
+        "--centreon-hostgroup",
+        default=env_or_none("CENTREON_HOSTGROUP"),
+        help=(
+            "Nom du hostgroup Centreon "
+            "(env: CENTREON_HOSTGROUP)"
+        ),
+    )
+
+    parser.add_argument(
+        "--centreon-host-address",
+        default=(
+            env_or_none("CENTREON_HOST_ADDRESS")
+            or DEFAULT_HOST_ADDRESS
+        ),
+        help=(
+            "Adresse des hôtes Centreon "
+            "(env: CENTREON_HOST_ADDRESS, "
+            f"défaut: {DEFAULT_HOST_ADDRESS})"
+        ),
+    )
+
+    # ------------------------------------------------------------------------
+    # Options
+    # ------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "N'effectue aucune modification Centreon. "
+            "Les appels d'écriture, services/deploy et "
+            "generate-and-reload sont désactivés."
+        ),
+    )
+
+    parser.add_argument(
+        "--centreon-commit",
+        action="store_true",
+        help=(
+            "Après la synchronisation, lance "
+            "generate-and-reload sur le poller indiqué."
+        ),
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Active les logs de debug.",
+    )
+
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "Désactive la vérification SSL "
+            "pour les connexions HTTPS."
+        ),
+    )
+
+    return parser
+
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+def require_value(
+    value: Optional[str],
+    option_name: str,
+) -> str:
+    if not value:
+        raise ValueError(
+            f"{option_name} est obligatoire."
+        )
+
+    return value
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        cato_api_key = require_value(
+            args.cato_api_key,
+            "--cato-api-key / CATO_API_KEY",
+        )
+
+        cato_account_id = require_value(
+            args.cato_account_id,
+            "--cato-account-id / CATO_ACCOUNT_ID",
+        )
+
+        centreon_url = require_value(
+            args.centreon_url,
+            "--centreon-url / CENTREON_URL",
+        )
+
+        centreon_user = require_value(
+            args.centreon_user,
+            "--centreon-user / CENTREON_USER",
+        )
+
+        centreon_password = require_value(
+            args.centreon_password,
+            "--centreon-password / CENTREON_PASSWORD",
+        )
+
+        # Le poller ID n'est obligatoire que si on demande le commit.
+        # En dry-run, même --centreon-commit ne provoque aucun reload.
+        if args.centreon_commit and not args.dry_run:
+            if args.centreon_poller_id is None:
+                raise ValueError(
+                    "--centreon-poller-id / CENTREON_POLLER_ID "
+                    "est obligatoire avec --centreon-commit."
+                )
+
+        verify_ssl = not args.insecure
+
+        if args.insecure:
+            urllib3.disable_warnings(
+                urllib3.exceptions.InsecureRequestWarning
+            )
+
+        # --------------------------------------------------------------------
+        # Initialisation APIs
+        # --------------------------------------------------------------------
+
+        cato = CatoAPI(
+            api_key=cato_api_key,
+            account_id=cato_account_id,
+            api_url=args.cato_api_url,
+            verify_ssl=verify_ssl,
+            debug=args.debug,
+        )
+
+        centreon = CentreonAPI(
+            base_url=centreon_url,
+            api_version=args.centreon_api_version,
+            username=centreon_user,
+            password=centreon_password,
+            verify_ssl=verify_ssl,
+            debug=args.debug,
+        )
+
+        # --------------------------------------------------------------------
+        # Login Centreon
+        # --------------------------------------------------------------------
+
+        print("Connexion à Centreon...")
+
+        centreon.login()
+
+        print("Connexion Centreon OK.")
+
+        # --------------------------------------------------------------------
+        # Résolution des templates
+        # --------------------------------------------------------------------
+
+        print(
+            "Recherche des templates d'hôte Centreon : "
+            + ", ".join(HOST_TEMPLATE_NAMES)
+        )
+
+        template_ids_by_name = (
+            centreon.resolve_host_template_ids(
+                HOST_TEMPLATE_NAMES
+            )
+        )
+
+        for name, template_id in template_ids_by_name.items():
+            print(
+                f"  {name} -> ID {template_id}"
+            )
+
+        # --------------------------------------------------------------------
+        # Résolution du hostgroup
+        # --------------------------------------------------------------------
+
+        hostgroup_id: Optional[int] = None
+
+        if args.centreon_hostgroup:
+            print(
+                f"Recherche du hostgroup Centreon "
+                f"'{args.centreon_hostgroup}'..."
+            )
+
+            hostgroup_id = centreon.resolve_host_group_id(
+                args.centreon_hostgroup
+            )
+
+            print(
+                f"  {args.centreon_hostgroup} "
+                f"-> ID {hostgroup_id}"
+            )
+
+        # --------------------------------------------------------------------
+        # Synchronisation
+        # --------------------------------------------------------------------
+
+        synchronizer = Synchronizer(
+            cato=cato,
+            centreon=centreon,
+            dry_run=args.dry_run,
+            debug=args.debug,
+            host_address=args.centreon_host_address,
+            hostgroup_id=hostgroup_id,
+        )
+
+        synchronizer.run(
+            template_ids_by_name
+        )
+
+        # --------------------------------------------------------------------
+        # Generate + reload
+        # --------------------------------------------------------------------
+
+        if args.centreon_commit:
+            if args.dry_run:
+                print(
+                    "\n[DRY-RUN] --centreon-commit demandé, "
+                    "mais aucun generate-and-reload ne sera exécuté."
+                )
+            else:
+                print(
+                    f"\nGénération et reload de la configuration "
+                    f"du poller {args.centreon_poller_id}..."
+                )
+
+                centreon.generate_and_reload(
+                    args.centreon_poller_id
+                )
+
+                print(
+                    "Génération et reload Centreon OK."
+                )
+
+        else:
+            print(
+                "\nPas de --centreon-commit : "
+                "aucun generate-and-reload exécuté."
+            )
+
+        return 0
+
+    except (APIError, ValueError) as exc:
+        print(
+            f"\nERREUR : {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    except KeyboardInterrupt:
+        print(
+            "\nInterrompu.",
+            file=sys.stderr,
+        )
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
