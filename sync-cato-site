@@ -121,9 +121,7 @@ class CatoAPI:
                         id
                         name
                     }
-                    siteLocation {
-                        cityName
-                    }
+                    description
                 }
             }
         }
@@ -148,7 +146,7 @@ class CatoAPI:
 
             return {
                 "city_name": str(
-                    location.get("cityName") or ""
+                    location.get("description") or ""
                 ),
             }
 
