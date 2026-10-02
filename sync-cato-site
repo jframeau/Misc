@@ -627,6 +627,7 @@ class Synchronizer:
         debug: bool = False,
         host_address: str = DEFAULT_HOST_ADDRESS,
         hostgroup_id: Optional[int] = None,
+        poller_id: int = 1,
     ):
         self.cato = cato
         self.centreon = centreon
@@ -634,12 +635,13 @@ class Synchronizer:
         self.debug = debug
         self.host_address = host_address
         self.hostgroup_id = hostgroup_id
+        self.poller_id = poller_id
 
     def build_host_name(
         self,
         site_id: str,
     ) -> str:
-        return f"M_{site_id}_CatoSite"
+        return f"{site_id}_CatoSite"
 
     def build_create_payload(
         self,
@@ -650,8 +652,8 @@ class Synchronizer:
         site_name = site["name"]
 
         payload: Dict[str, Any] = {
-            "monitoring_server_id": 0,
-            "name": self.build_host_name(site_id),
+            "monitoring_server_id": self.poller_id,
+            "name": self.build_host_name(site_name),
             "address": self.host_address,
             "alias": site_name,
             "templates": template_ids,
@@ -778,7 +780,7 @@ class Synchronizer:
     ) -> Optional[int]:
         site_id = site["id"]
         site_name = site["name"]
-        host_name = self.build_host_name(site_id)
+        host_name = self.build_host_name(site_name)
 
         print(
             f"\nSite Cato : {site_name} "
@@ -893,8 +895,8 @@ class Synchronizer:
         updated = 0
         skipped = 0
 
-        for site in sites:
-            host_name = self.build_host_name(site["id"])
+        for site in sites[:5]:
+            host_name = self.build_host_name(site["name"])
 
             existing = self.centreon.find_host_by_name(
                 existing_hosts,
@@ -1254,6 +1256,7 @@ def main() -> int:
             debug=args.debug,
             host_address=args.centreon_host_address,
             hostgroup_id=hostgroup_id,
+            poller_id=args.centreon_poller_id
         )
 
         synchronizer.run(
